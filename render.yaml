@@ -7,8 +7,8 @@ services:
     buildCommand: pip install -r requirements.txt
     startCommand: gunicorn app:app --bind 0.0.0.0:$PORT --workers 2 --timeout 120 --log-level info
     envVars:
-      - key: ANTHROPIC_API_KEY
-        sync: false          # Set this manually in Render dashboard
+      - key: GROQ_API_KEY
+        sync: false
       - key: FLASK_ENV
         value: production
       - key: PYTHON_VERSION
