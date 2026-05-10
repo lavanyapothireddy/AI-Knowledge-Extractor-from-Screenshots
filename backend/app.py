@@ -1,6 +1,6 @@
 import os
 import base64
-import anthropic
+import httpx
 from flask import Flask, request, jsonify
 from flask_cors import CORS
 from werkzeug.utils import secure_filename
@@ -12,7 +12,9 @@ ALLOWED_EXTENSIONS = {"png", "jpg", "jpeg", "gif", "webp", "bmp"}
 MAX_CONTENT_LENGTH = 10 * 1024 * 1024  # 10MB
 app.config["MAX_CONTENT_LENGTH"] = MAX_CONTENT_LENGTH
 
-client = anthropic.Anthropic(api_key=os.environ.get("ANTHROPIC_API_KEY"))
+GROQ_API_KEY = os.environ.get("GROQ_API_KEY")
+GROQ_API_URL = "https://api.groq.com/openai/v1/chat/completions"
+GROQ_VISION_MODEL = "meta-llama/llama-4-scout-17b-16e-instruct"
 
 
 def allowed_file(filename):
@@ -45,7 +47,7 @@ Format your response in clear Markdown with headers and bullet points.""",
 
         "text": """Extract ALL text from this screenshot exactly as it appears. Include:
 - Headers and titles
-- Body text and paragraphs  
+- Body text and paragraphs
 - Labels and captions
 - Button text and UI labels
 - Numbers and codes
@@ -78,6 +80,44 @@ Return valid JSON only, no extra text.""",
     return prompts.get(extraction_type, prompts["full"])
 
 
+def call_groq_vision(image_data, media_type, prompt):
+    headers = {
+        "Authorization": f"Bearer {GROQ_API_KEY}",
+        "Content-Type": "application/json",
+    }
+    payload = {
+        "model": GROQ_VISION_MODEL,
+        "messages": [
+            {
+                "role": "user",
+                "content": [
+                    {
+                        "type": "image_url",
+                        "image_url": {
+                            "url": f"data:{media_type};base64,{image_data}"
+                        },
+                    },
+                    {
+                        "type": "text",
+                        "text": prompt,
+                    },
+                ],
+            }
+        ],
+        "max_tokens": 4096,
+        "temperature": 0.2,
+    }
+
+    with httpx.Client(timeout=90) as client:
+        response = client.post(GROQ_API_URL, headers=headers, json=payload)
+        response.raise_for_status()
+        data = response.json()
+
+    content = data["choices"][0]["message"]["content"]
+    tokens_used = data.get("usage", {}).get("total_tokens", 0)
+    return content, tokens_used
+
+
 @app.route("/health", methods=["GET"])
 def health():
     return jsonify({"status": "healthy", "service": "AI Knowledge Extractor"}), 200
@@ -85,6 +125,9 @@ def health():
 
 @app.route("/api/extract", methods=["POST"])
 def extract_knowledge():
+    if not GROQ_API_KEY:
+        return jsonify({"error": "GROQ_API_KEY is not configured on the server."}), 500
+
     if "file" not in request.files and "image_base64" not in request.form:
         return jsonify({"error": "No image provided"}), 400
 
@@ -119,53 +162,40 @@ def extract_knowledge():
     prompt = build_extraction_prompt(extraction_type, custom_prompt)
 
     try:
-        message = client.messages.create(
-            model="claude-opus-4-5",
-            max_tokens=4096,
-            messages=[
-                {
-                    "role": "user",
-                    "content": [
-                        {
-                            "type": "image",
-                            "source": {
-                                "type": "base64",
-                                "media_type": media_type,
-                                "data": image_data,
-                            },
-                        },
-                        {"type": "text", "text": prompt},
-                    ],
-                }
-            ],
-        )
+        result, tokens_used = call_groq_vision(image_data, media_type, prompt)
+        return jsonify({
+            "success": True,
+            "result": result,
+            "extraction_type": extraction_type,
+            "filename": filename,
+            "tokens_used": tokens_used,
+            "model": GROQ_VISION_MODEL,
+        })
 
-        result = message.content[0].text
-        tokens_used = message.usage.input_tokens + message.usage.output_tokens
+    except httpx.HTTPStatusError as e:
+        status = e.response.status_code
+        try:
+            detail = e.response.json().get("error", {}).get("message", str(e))
+        except Exception:
+            detail = str(e)
+        if status == 429:
+            return jsonify({"error": "Rate limit exceeded. Please wait a moment and try again."}), 429
+        if status == 401:
+            return jsonify({"error": "Invalid GROQ_API_KEY. Check your server configuration."}), 401
+        return jsonify({"error": f"Groq API error: {detail}"}), status
 
-        return jsonify(
-            {
-                "success": True,
-                "result": result,
-                "extraction_type": extraction_type,
-                "filename": filename,
-                "tokens_used": tokens_used,
-                "model": "claude-opus-4-5",
-            }
-        )
+    except httpx.TimeoutException:
+        return jsonify({"error": "Request timed out. Please try again."}), 504
 
-    except anthropic.APIConnectionError:
-        return jsonify({"error": "Failed to connect to AI service. Please try again."}), 503
-    except anthropic.RateLimitError:
-        return jsonify({"error": "Rate limit exceeded. Please wait a moment and try again."}), 429
-    except anthropic.APIStatusError as e:
-        return jsonify({"error": f"AI service error: {e.message}"}), e.status_code
     except Exception as e:
         return jsonify({"error": f"An unexpected error occurred: {str(e)}"}), 500
 
 
 @app.route("/api/batch-extract", methods=["POST"])
 def batch_extract():
+    if not GROQ_API_KEY:
+        return jsonify({"error": "GROQ_API_KEY is not configured on the server."}), 500
+
     if "files" not in request.files:
         return jsonify({"error": "No files provided"}), 400
 
@@ -173,7 +203,7 @@ def batch_extract():
     extraction_type = request.form.get("extraction_type", "summary")
     results = []
 
-    for file in files[:5]:  # Limit to 5 files per batch
+    for file in files[:5]:
         if file and allowed_file(file.filename):
             filename = secure_filename(file.filename)
             media_type = get_media_type(filename)
@@ -181,31 +211,12 @@ def batch_extract():
             prompt = build_extraction_prompt(extraction_type)
 
             try:
-                message = client.messages.create(
-                    model="claude-opus-4-5",
-                    max_tokens=2048,
-                    messages=[
-                        {
-                            "role": "user",
-                            "content": [
-                                {
-                                    "type": "image",
-                                    "source": {
-                                        "type": "base64",
-                                        "media_type": media_type,
-                                        "data": image_data,
-                                    },
-                                },
-                                {"type": "text", "text": prompt},
-                            ],
-                        }
-                    ],
-                )
+                content, tokens_used = call_groq_vision(image_data, media_type, prompt)
                 results.append({
                     "filename": filename,
                     "success": True,
-                    "result": message.content[0].text,
-                    "tokens_used": message.usage.input_tokens + message.usage.output_tokens,
+                    "result": content,
+                    "tokens_used": tokens_used,
                 })
             except Exception as e:
                 results.append({
